@@ -1,0 +1,21 @@
+{
+  "name": "cyberfixer-client-solid",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0",
+    "vite-plugin-solid": "^2.10.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "solid-js": "^1.9.0",
+    "@colyseus/sdk": "^0.18.2"
+  }
+}
