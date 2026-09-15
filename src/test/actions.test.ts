@@ -11,6 +11,7 @@ import { SeededRandom } from "../persistence/seeded-random.ts";
 import { ActionRegistry, type ActionContext, type ActionDefinition } from "../actions/action-definition.ts";
 import { EffectHandlerRegistry, type ActionApi, type ResolvedActionContext } from "../actions/effect-handler.ts";
 import { performAction, proposeAction, resolveEffect, validateAction, type PerformActionDeps } from "../actions/pipeline.ts";
+import { PendingActionRegistry } from "../actions/pending-action-registry.ts";
 import { HierarchyRegistry } from "../query/hierarchy-registry.ts";
 import { selectEntities, evaluateBoolExpr } from "../query/interpreter.ts";
 import type { BoolExpr } from "../query/types.ts";
@@ -1114,5 +1115,69 @@ describe("'Surveillance State': can a targetQuery itself (not just an effect, af
     };
 
     expect(() => evaluateBoolExpr(nothingRespondsToMe, "root", resolver)).toThrow(/ref to unbound label "me"/);
+  });
+});
+
+describe("'Wiretap': api.pendingActions gives an effect handler a real, working reference into another pending action's own intent — the actual capability the PendingActionRegistry-in-buildContent refactor was for", () => {
+  it("an effect handler reads a DIFFERENT pending action's own targetIds via api.pendingActions and acts on the revealed target — something no BoolExpr/NumExpr query could ever express, since PendingAction.definition has live function fields", () => {
+    const bus = new EventBus();
+    const entities = new EntityStore(bus);
+    const modifiers = new ModifierStore(bus);
+    const resolver = new PropertyResolver(entities, modifiers);
+    const handlers = new EffectHandlerRegistry();
+    const actions = new ActionRegistry();
+    const random = new SeededRandom(1);
+    const pendingActions = new PendingActionRegistry();
+    const deps: PerformActionDeps = { entities, resolver, modifiers, handlers, bus, random, pendingActions };
+
+    entities.add(createCard("Ace", { id: "ace", ownership: ["fixer-A"] }));
+    entities.add(createCard("Target of the shakedown", { id: "target-a", ownership: ["fixer-B"] }));
+    entities.add(createCard("Data Broker", { id: "broker", ownership: ["fixer-C"] }));
+
+    // simulates an already-proposed, still-pending shakedown that a
+    // real room's own proposeAndPush would have created
+    const shakedownDefinition: ActionDefinition = { id: "shakedown", category: () => "coercion", targetsOwn: false, targetsOthers: true, targetQuery: () => ({ op: "and", exprs: [] }), effect: "noopShakedownEffect" };
+    pendingActions.set("pending-shakedown", {
+      intent: { performerId: "ace", actingFixerId: "fixer-A", targetIds: ["target-a"] },
+      actionId: "shakedown",
+      definition: shakedownDefinition,
+      capability: "preferred",
+      adjustedCost: 2,
+    });
+
+    const wiretap: ActionDefinition = {
+      id: "wiretap",
+      category: () => "data",
+      targetsOwn: true,
+      targetsOthers: true,
+      targetQuery: () => ({ op: "and", exprs: [] }),
+      effect: "wiretapEffect",
+    };
+    actions.register(wiretap);
+    handlers.register("wiretapEffect", (_ctx, api) => {
+      const revealed = api.pendingActions?.get("pending-shakedown");
+      if (!revealed) throw new Error("expected to find the pending shakedown");
+      for (const targetId of revealed.intent.targetIds) {
+        api.entities.addTag(targetId, "exposed-by-wiretap");
+      }
+    });
+
+    performAction({ performerId: "broker", actingFixerId: "fixer-C", targetIds: [] }, wiretap, deps);
+
+    expect(entities.get("target-a")?.tags.has("exposed-by-wiretap")).toBe(true);
+  });
+
+  it("is undefined, not a throw, when deps was constructed without a PendingActionRegistry at all — the overwhelming majority of existing tests, and every game that doesn't do interactive propose-now-resolve-later play", () => {
+    const { deps, actions, handlers } = makeRig();
+    const noRegistryAction: ActionDefinition = { id: "no-registry-action", category: () => "test", targetsOwn: true, targetsOthers: true, targetQuery: () => ({ op: "and", exprs: [] }), effect: "checksForRegistryEffect" };
+    actions.register(noRegistryAction);
+    let observedPendingActions: unknown = "sentinel — never a real value";
+    handlers.register("checksForRegistryEffect", (_ctx, api) => {
+      observedPendingActions = api.pendingActions;
+    });
+    const performer = createCard("Performer", { ownership: ["fixer-A"] });
+    deps.entities.add(performer);
+    performAction({ performerId: performer.id, actingFixerId: "fixer-A", targetIds: [] }, noRegistryAction, deps);
+    expect(observedPendingActions).toBeUndefined();
   });
 });

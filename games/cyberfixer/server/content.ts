@@ -77,10 +77,11 @@
 
 import type { BoolExpr, CompareOp, NumExpr } from "../../../src/query/types.ts";
 import { evaluateBoolExpr, evaluateNumExpr } from "../../../src/query/interpreter.ts";
+import type { GameEvent } from "../../../src/events/types.ts";
 import { QueryFunctionRegistry } from "../../../src/query/functions.ts";
 import { HierarchyRegistry } from "../../../src/query/hierarchy-registry.ts";
 import { Hierarchy } from "../../../src/events/hierarchy.ts";
-import { Stack, LIFO_POLICY } from "../../../src/events/stack.ts";
+import { Stack, bidAwarePolicy } from "../../../src/events/stack.ts";
 import { PriorityTracker } from "../../../src/phases/priority-tracker.ts";
 import { Deck, DECK_HIERARCHY_NAME, deckRandomDomain } from "./deck.ts";
 import type { EventBus } from "../../../src/events/bus.ts";
@@ -88,180 +89,40 @@ import type { ActionDefinition } from "../../../src/actions/action-definition.ts
 import { ActionRegistry } from "../../../src/actions/action-definition.ts";
 import { createAbilityRegistry, buildActivateAction, buildActivateEffectHandler, type AbilityRegistry } from "../../../src/actions/activate.ts";
 import { EffectHandlerRegistry } from "../../../src/actions/effect-handler.ts";
+import { PendingActionRegistry } from "../../../src/actions/pending-action-registry.ts";
 import { ALWAYS_TRUE_QUERY, type PhaseDefinition } from "../../../src/phases/phase-definition.ts";
 import { RuleTable } from "../../../src/rules/rule-table.ts";
 import { RuleHandlerRegistry } from "../../../src/rules/rule-handler.ts";
+import { registerRule } from "../../../src/rules/register-rule.ts";
+import { registerReflex, type ReflexDeps } from "../../../src/actions/reflex.ts";
+import { registerDefeat } from "./content-defeat.ts";
 import { newModifierId } from "../../../src/properties/modifier.ts";
 import { PropertyBoundsRegistry } from "../../../src/properties/property-bounds.ts";
 import type { PropertyResolver } from "../../../src/properties/property-resolver.ts";
 import { currentOwner } from "../../../src/core/entity.ts";
+import { namespacedTag } from "../../../src/core/tags.ts";
 import type { EntityStore } from "../../../src/events/entity-store.ts";
 import type { EntityId } from "../../../src/core/id.ts";
 
 /** Faction tags — purely descriptive/flavor for this simple example; no faction-specific rules yet. */
-export const FACTIONS = ["corporations", "gangs", "shimmer", "politics"] as const;
-export type Faction = (typeof FACTIONS)[number];
-
-export const CONTRACTOR_TAG = "contractor";
-export const CONTRACT_TAG = "contract";
-export const CONTRACT_TYPE_TAG_PREFIX = "contract-type:";
-
-export function discardZoneIdFor(fixerId: EntityId): EntityId {
-  return `${fixerId}-discard`;
-}
-
-export function boardZoneIdFor(fixerId: EntityId): EntityId {
-  return `${fixerId}-board`;
-}
-
-export function deckZoneIdFor(fixerId: EntityId): EntityId {
-  return `${fixerId}-deck-zone`;
-}
-
-export function handZoneIdFor(fixerId: EntityId): EntityId {
-  return `${fixerId}-hand-zone`;
-}
-
-/** `{op:"compare", left:{op:"prop",name},cmp,right:{op:"lit",value}}` — the shape a bare property-vs-literal check takes now that compare's both sides are full NumExprs. Small helper purely to keep call sites readable. */
-function propertyCompare(name: string, cmp: CompareOp, value: number): BoolExpr {
-  return { op: "compare", left: { op: "prop", name }, cmp, right: { op: "lit", value } };
-}
-
-/**
- * Only cards actually ON THE BOARD count toward inflow/outflow. This
- * `inZone` check was missing before the hand/deck pipeline existed —
- * every contractor was placed directly in play at setup, so there was
- * never a card sitting anywhere else to expose the gap. The moment a
- * card can sit in a deck or hand (undrawn/undeployed), it would
- * otherwise have silently started contributing to its owner's totals
- * before ever being played.
- */
-function incomeSourcesOwnedBy(fixerId: EntityId): BoolExpr {
-  return {
-    op: "and",
-    exprs: [
-      { op: "or", exprs: [{ op: "hasTag", tag: CONTRACTOR_TAG }, { op: "hasTag", tag: CONTRACT_TAG }] },
-      { op: "ownedBy", fixerId },
-      { op: "inZone", zoneId: boardZoneIdFor(fixerId) },
-    ],
-  };
-}
-
-/** The fold expression for "this fixer's total `prop` across everything they own that's actually on the board." */
-function sumOwnedExpr(fixerId: EntityId, prop: string) {
-  return { op: "fold" as const, fold: "sum" as const, of: { op: "prop" as const, name: prop }, where: incomeSourcesOwnedBy(fixerId) };
-}
-
-/**
- * Recomputes every fixer's inflow from their current board. Exported
- * standalone (not just a rule handler) because it also needs to run
- * ONCE, explicitly, right after setupMatch and before the turn cycle
- * starts — otherwise the very first phase:started (which resets the
- * first fixer's outflow, bounded by THIS inflow value) would fire before
- * inflow has ever been computed for real, capping outflow at a stale
- * placeholder instead of the actual starting board total.
- */
-export function recomputeInflow(seatOrder: readonly EntityId[], entities: EntityStore, resolver: PropertyResolver): void {
-  for (const fixerId of seatOrder) {
-    const inflow = evaluateNumExpr(sumOwnedExpr(fixerId, "inflow"), fixerId, resolver);
-    entities.setProperty(fixerId, "inflow", inflow);
-  }
-}
-
-// --- contracts -------------------------------------------------------
-
-export interface ContractDefinition {
-  id: string;
-  basePayout: number;
-  /** A BoolExpr, evaluated with the fixer who owns the contract as the ambient subject — e.g. `{op:"compare", left:{op:"fold",fold:"count",where:{op:"hasTag",tag:"ai"}}, cmp:"eq", right:{op:"lit",value:0}}`. */
-  bonus?: { when: BoolExpr; amount: number };
-  cancelWhen?: BoolExpr;
-  cancelPenalty?: { amount: number; durationTurns: number };
-}
-
-export class ContractRegistry {
-  private defs = new Map<string, ContractDefinition>();
-  register(def: ContractDefinition): void {
-    this.defs.set(def.id, def);
-  }
-  get(id: string): ContractDefinition | undefined {
-    return this.defs.get(id);
-  }
-}
-
-function contractTypeOf(entityTags: ReadonlySet<string>): string | undefined {
-  for (const tag of entityTags) {
-    if (tag.startsWith(CONTRACT_TYPE_TAG_PREFIX)) return tag.slice(CONTRACT_TYPE_TAG_PREFIX.length);
-  }
-  return undefined;
-}
-
-export interface CyberFixerContent {
-  actions: ActionRegistry;
-  /** Abilities reached through the single generic "activate" action (registered in `actions`), dispatched by ctx.params.abilityId — e.g. "shakedown". A card grants one by carrying an `ability:<id>` tag. */
-  abilities: AbilityRegistry;
-  effectHandlers: EffectHandlerRegistry;
-  ruleTable: RuleTable;
-  ruleHandlers: RuleHandlerRegistry;
-  contracts: ContractRegistry;
-  queryFunctions: QueryFunctionRegistry;
-  bounds: PropertyBoundsRegistry;
-  /** What "everyone's ready" means for THIS game — the lobby gate, evaluated against the table. Owned here, not room.ts, since "how many fixers need to ready up" is game content, not composition-root plumbing. */
-  pregamePhase: PhaseDefinition;
-  /** Trivial for now — no rich postgame content yet, just an immediately-completable stage so Match's lifecycle is whole. */
-  postgamePhase: PhaseDefinition;
-  /**
-   * The three phases within EVERY fixer's turn — upkeep (fully
-   * automatic: draw, contract re-evaluation/cancellation, penalty
-   * ticking — no player commitments legal here, and per the theme's own
-   * "golfer" framing, nothing here is counterable, ever), main (the
-   * only phase with agency — deploy/activate are legal here, and this
-   * is where the interactive stack/priority loop actually applies), and
-   * end (same automatic shape as upkeep — currently no end-of-turn
-   * triggers exist, so this phase is honestly a no-op for now, kept for
-   * structural completeness). All three share the SAME completionGate
-   * (the shared "resolution" stack must be empty) — see stack below.
-   */
-  turnPhases: PhaseDefinition[];
-  /** Phase ids that auto-advance the moment their own completionGate is satisfied — no player message needed, ever. Currently upkeep and end (fully automatic, no commitments legal there); main is deliberately absent — it always waits for an explicit phaseAdvance. */
-  autoAdvancingPhaseIds: ReadonlySet<string>;
-  /** The Hierarchy underlying `stack` below — exposed separately because Stack itself has no public getter for its own underlying Hierarchy. Needed by room.ts's own Snapshot calls: every Hierarchy a game registers must be passed to createSnapshot/restoreSnapshot, and this one is easy to miss since it's normally only ever touched THROUGH Stack. */
-  resolutionHierarchy: Hierarchy;
-  /**
-   * The ONE stack shared by every phase in a turn — upkeep/end auto-
-   * drain it (push, resolve immediately, no pause, ever); main pauses
-   * for priority between pushes. Stack itself has no idea which mode
-   * applies; that's entirely in how room.ts drives it per phase. See
-   * README.md's "Reactive priority" section for the full reasoning.
-   */
-  stack: Stack;
-  /** APNAP priority tracking for main phase's interactive stack use — see PriorityTracker's own docs. Unused during upkeep/end, which never consult it at all. */
-  priority: PriorityTracker;
-  /** "Every fixer has passed" — read by room.ts's own "pass" message handler. A plain fold over the passed-priority tag, reset automatically by content's own rules whenever the shared resolution stack changes (push/resolve/counter/reparent) — see this file's own pass-priority section. */
-  allFixersPassed: BoolExpr;
-  /**
-   * The resolution policy room.ts reads when resolving the shared
-   * stack — currently LIFO, ALWAYS, for every match. This is a
-   * DELIBERATE STUB, not an oversight: a card that changes the active
-   * policy for the rest of a turn ("Escalate the Chain") would need
-   * this to become live, per-match, mutable state a card's effect can
-   * overwrite — a small registry, similar in shape to
-   * PendingActionRegistry, holding "the currently active policy" as one
-   * slot room.ts reads from instead of this fixed constant. Confirmed
-   * explicitly: stays fixed until a real policy-shifting card actually
-   * gets built, not before.
-   */
-  resolutionPolicy: NumExpr;
-  /** The concrete Hierarchy tracking undrawn contractors — needed by room.ts directly for PropertyResolver/PhaseRunnerDeps wiring and Snapshot's hierarchies param. Game CONTENT code should reach for `deck` below instead; this is engine-facing plumbing, not this game's own vocabulary. */
-  deckHierarchy: Hierarchy;
-  /** deckHierarchy registered under DECK_HIERARCHY_NAME, for query-time childOf/descendantOf use (and threading into PropertyResolver/PhaseRunnerDeps) — read-only from this side. */
-  hierarchies: HierarchyRegistry;
-  /** "Deck" as THIS GAME's own concept — a thin, named wrapper over deckHierarchy (see deck.ts). What draft/drawCard actually call. */
-  deck: Deck;
-}
-
-/** Name of the Hierarchy/Stack shared by every phase in a turn. */
-export const RESOLUTION_STACK_NAME = "resolution";
+import {
+  CONTRACTOR_TAG,
+  CONTRACT_TAG,
+  RESOLUTION_STACK_NAME,
+  abilityTag,
+  boardZoneIdFor,
+  contractTypeOf,
+  deckZoneIdFor,
+  discardZoneIdFor,
+  handZoneIdFor,
+  propertyCompare,
+  recomputeInflow,
+  sumOwnedExpr,
+  type ContractDefinition,
+  ContractRegistry,
+  type CyberFixerContent,
+} from "./content-shared.ts";
+export * from "./content-shared.ts";
 
 /** Builds fresh, independent registries — call once per room/match, never shared across matches. `bus` is needed because deckHierarchy/the resolution Stack (Layer 2) announce their own mutations on it, same as EntityStore/ModifierStore do. `entities` is needed because Stack/PriorityTracker externalize their own bookkeeping (pushedAtSequence, stackDepth, priority tags) as real entity state — see each one's own docs for why. */
 export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, entities: EntityStore): CyberFixerContent {
@@ -286,8 +147,47 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   // constructing them before "table-1" exists is safe; only USING them
   // requires it to already exist, which setupMatch guarantees by then.
   const stack = new Stack(resolutionHierarchy, entities, bus, "table-1");
+  const pendingActions = new PendingActionRegistry();
+
+  // "Wiretap"'s weaker sibling: dry-runs a SPECIFIC pending action's own
+  // targetQuery against a candidate, answering "would I qualify as a
+  // legal target of that" WITHOUT revealing who the actual targets are
+  // (that's the full reveal — see api.pendingActions itself, used
+  // directly inside an effect handler, not through the query grammar at
+  // all). This one genuinely belongs in the grammar, as a BoolExpr any
+  // card's own targetQuery/performerCondition can reach for — "am I the
+  // KIND of thing this could hit" is exactly the shape a legality check
+  // already has, unlike a full reveal, which only makes sense as
+  // something an effect spends a real turn on.
+  //
+  // dependencies() honestly returns [] here, not a best-effort guess —
+  // DepKey is a closed union (tag:/prop:/hierarchy:/zone/owner) with no
+  // "unknown, assume everything" option, and this function's TRUE
+  // dependencies are whatever the target pending action's own
+  // targetQuery happens to read, which varies per call and can't be
+  // known ahead of time. A subscription built on this call will not
+  // correctly react to changes in whatever the underlying targetQuery
+  // actually reads — a real, stated limitation, not a hidden one.
+  queryFunctions.register("wouldQualifyAsTarget", {
+    evaluate: (subjectId, ctx, args) => {
+      const pendingItemId = args?.pendingItemId as string | undefined;
+      if (!pendingItemId) return false;
+      const pending = pendingActions.get(pendingItemId);
+      if (!pending) return false; // nothing currently pending under that id — an honest "no", not a throw
+      return evaluateBoolExpr(pending.definition.targetQuery(pending.intent), subjectId, ctx);
+    },
+    dependencies: () => [],
+  });
+
   const priority = new PriorityTracker(seatOrder, entities);
-  const resolutionPolicy: NumExpr = LIFO_POLICY;
+  // bidAwarePolicy("committedAmount"), not plain LIFO_POLICY — proven in
+  // stack.test.ts to behave IDENTICALLY to LIFO for anything that never
+  // bids at all (the overwhelming majority of actions), while correctly
+  // resolving an actual bid war by committed amount when one exists.
+  // Still the fixed, deliberate stub for MUTABLE per-match policy
+  // changes (a card overwriting this for the rest of a turn) — that gap
+  // is unaffected by this change, only the game's own DEFAULT moved.
+  const resolutionPolicy: NumExpr = bidAwarePolicy("committedAmount");
   bounds.set("outflow", { min: 0, max: { refProp: "inflow" } });
 
   const discardZoneIds = new Set(seatOrder.map(discardZoneIdFor));
@@ -332,6 +232,51 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   };
   abilities.register(shakedown);
 
+  // --- claim (a bid-genre ability, reached through the same generic
+  // "activate" action as shakedown) -------------------------------------
+  //
+  // The first real, working instance of a "bid" — see room.ts's own
+  // proposeAndPush, which generically records ANY bid-category
+  // proposal's actual paid cost onto its own pending-item entity as
+  // committedAmount, which THIS game's own resolutionPolicy
+  // (bidAwarePolicy("committedAmount"), above) reads to decide who
+  // actually wins a contested claim. Nothing about claim itself knows
+  // about bidding as a concept — it just has category "bid" and a
+  // player-chosen cost; the mechanism is entirely generic plumbing
+  // shared by any future bid-genre card.
+  //
+  // No active-turn requirement, deliberately — unlike shakedown, EITHER
+  // fixer can propose (or respond to) a claim at any moment during main
+  // phase, the same "either side may act, no rotation" shape the
+  // pass-priority mechanism itself already assumes. A bid war needs
+  // both sides able to bid, not just whoever's turn it happens to be.
+  const claim: ActionDefinition = {
+    id: "claim",
+    category: () => "bid",
+    targetsOwn: false,
+    targetsOthers: true,
+    minTargets: () => 1,
+    maxTargets: () => 1,
+    targetQuery: (ctx) => ({
+      op: "and",
+      exprs: [
+        { op: "hasTag", tag: CONTRACTOR_TAG },
+        { op: "not", expr: { op: "ownedBy", fixerId: ctx.actingFixerId } },
+        { op: "or", exprs: seatOrder.map((fixerId) => ({ op: "inZone" as const, zoneId: boardZoneIdFor(fixerId) })) },
+      ],
+    }),
+    performerCondition: () => ({ op: "hasTag", tag: CONTRACTOR_TAG }),
+    timingCondition: () => duringMainPhase,
+    // The player's own chosen bid amount, read from params — this is
+    // what committedAmount above ends up reflecting. Defaults to the
+    // smallest possible real bid (1) if the client sent nothing, rather
+    // than silently rejecting or falling back to 0 (which would tie
+    // with every other non-bidding action instead of genuinely committing).
+    cost: (ctx) => ({ prop: "outflow", amount: Math.max(1, (ctx.params?.bidAmount as number | undefined) ?? 1) }),
+    effect: "claimEffect",
+  };
+  abilities.register(claim);
+
   // The ONE generic entry point every ability (shakedown, and whatever
   // gets added later) is actually reached through — see
   // src/actions/activate.ts for what this dispatches and why.
@@ -350,6 +295,29 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
       priority: 0,
       source: "shakedown",
     });
+  });
+
+  // Whichever claim survives the bid war (see the resolutionPolicy this
+  // game registers, above) actually seizes the target — via
+  // api.entities.transferOwnershipTo (the SAME EntityStore method
+  // Turncoat's own design intends), not a raw `target.ownership = ...`
+  // assignment. That distinction matters concretely, not just
+  // stylistically: a raw assignment bypasses EntityStore entirely,
+  // firing no entity:ownershipChanged event at all — SyncManager never
+  // learns the ownership changed, and nothing else reactive to it does
+  // either. Caught exactly this way, live, while proving the bid war
+  // end to end over a real network connection. Every OTHER claim on the
+  // same target never reaches this handler at all: it either never
+  // resolves (buried under, or countered by, a higher bid) or fizzles
+  // at resolveEffect's own re-validation the moment the target stops
+  // being a legal one (ownedBy the acting fixer having already changed
+  // once the FIRST claim on it wins) — no special-casing needed here
+  // for "what if I lost the bid war," Protection's own mechanism
+  // already covers it for free.
+  effectHandlers.register("claimEffect", (ctx, api) => {
+    const targetId = ctx.targetIds[0]!;
+    if (!api.entities.get(targetId)) return; // Dead Drop — target vanished before this resolved; nothing to claim
+    api.entities.transferOwnershipTo(targetId, ctx.actingFixerId);
   });
 
   // --- draft: pregame, pick exactly 3 cards from your own deck straight onto your board ---
@@ -496,8 +464,7 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   // response is possible), this is also why cancellation is
   // uncounterable: it never goes through the stack at all, upkeep has
   // no pause to interject into in the first place.
-  ruleTable.add({ id: "recompute-contracts", trigger: "phase:started", match: (event) => event.phaseId === "upkeep", priority: 0, effect: "recomputeContracts" });
-  ruleHandlers.register("recomputeContracts", (_event, api) => {
+  registerRule(ruleTable, ruleHandlers, { id: "recompute-contracts", trigger: "phase:started", match: (event) => event.phaseId === "upkeep", priority: 0 }, (_event, api) => {
     for (const contract of api.entities.getAllEntities()) {
       if (!contract.tags.has(CONTRACT_TAG)) continue;
       if (contract.properties.discardedAt !== undefined) continue; // already discarded — resolved, don't reprocess
@@ -532,13 +499,7 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
     }
   });
 
-  ruleTable.add({
-    id: "recompute-fixer-inflow",
-    trigger: "action:resolved",
-    priority: 10,
-    effect: "recomputeFixerInflow",
-  });
-  ruleHandlers.register("recomputeFixerInflow", (_event, api) => {
+  registerRule(ruleTable, ruleHandlers, { id: "recompute-fixer-inflow", trigger: "action:resolved", priority: 10 }, (_event, api) => {
     recomputeInflow(seatOrder, api.entities, api.resolver);
   });
 
@@ -565,10 +526,8 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   // "activeFixer"), so no extra filtering is needed to target the right
   // one. The stored value can exceed inflow; outflow's PropertyBound
   // (registered above) is what actually caps what anything ever READS.
-  ruleTable.add({ id: "reset-outflow-budget", trigger: "phase:started", match: (event) => event.phaseId === "upkeep", effect: "resetOutflowBudget" });
-  ruleHandlers.register("resetOutflowBudget", (event, api) => {
-    const e = event as Extract<typeof event, { type: "phase:started" }>;
-    resetOutflowFor(e.subjectId, api.entities, api.resolver);
+  registerRule(ruleTable, ruleHandlers, { id: "reset-outflow-budget", trigger: "phase:started", match: (event) => event.phaseId === "upkeep" }, (event, api) => {
+    resetOutflowFor(event.subjectId, api.entities, api.resolver);
   });
 
   // Tags exactly the newly-active fixer with "active-turn" (used by
@@ -586,11 +545,9 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   // checked the actual outcome of that specific action. See
   // determinism.test.ts's own hardened assertions for the fix on that
   // side.
-  ruleTable.add({ id: "sync-active-turn", trigger: "phase:started", match: (event) => event.phaseId === "upkeep", effect: "syncActiveTurn" });
-  ruleHandlers.register("syncActiveTurn", (event, api) => {
-    const e = event as Extract<typeof event, { type: "phase:started" }>;
+  registerRule(ruleTable, ruleHandlers, { id: "sync-active-turn", trigger: "phase:started", match: (event) => event.phaseId === "upkeep" }, (event, api) => {
     for (const fixerId of seatOrder) {
-      if (fixerId === e.subjectId) api.entities.addTag(fixerId, "active-turn");
+      if (fixerId === event.subjectId) api.entities.addTag(fixerId, "active-turn");
       else api.entities.removeTag(fixerId, "active-turn");
     }
   });
@@ -606,9 +563,7 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   // makes "agency only in main phase" an ENFORCED rule rather than a
   // design intention nothing actually checks: deploy/shakedown's own
   // timingCondition below reads this tag directly.
-  ruleTable.add({ id: "sync-current-phase", trigger: "phase:started", effect: "syncCurrentPhase" });
-  ruleHandlers.register("syncCurrentPhase", (event, api) => {
-    const e = event as Extract<typeof event, { type: "phase:started" }>;
+  registerRule(ruleTable, ruleHandlers, { id: "sync-current-phase", trigger: "phase:started" }, (event, api) => {
     // Covers ALL FIVE phase ids that can ever fire phase:started — not
     // just the three turn phases. pregame/postgame are real PhaseRunner
     // instances too (see Match's own constructor), so they fire this
@@ -618,10 +573,11 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
     // timingCondition that tries to gate "pregame only" (draft/ready)
     // against a tag that was never actually being set.
     for (const phaseId of ["pregame", "upkeep", "main", "end", "postgame"]) {
-      if (phaseId === e.phaseId) api.entities.addTag("table-1", `phase:${phaseId}`);
+      if (phaseId === event.phaseId) api.entities.addTag("table-1", `phase:${phaseId}`);
       else api.entities.removeTag("table-1", `phase:${phaseId}`);
     }
   });
+
 
   // --- pass-priority: the simplified, non-rotating pass mechanism for
   // the shared "resolution" stack ---------------------------------------
@@ -646,11 +602,10 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   // countered, or is reparented, regardless of what that happens to
   // expose.
   for (const trigger of ["stack:pushed", "stack:resolved", "stack:countered", "stack:reparented"] as const) {
-    ruleTable.add({ id: `reset-priority-on-${trigger}`, trigger, effect: "resetPriorityPass" });
+    registerRule(ruleTable, ruleHandlers, { id: `reset-priority-on-${trigger}`, trigger }, (_event, api) => {
+      for (const fixerId of seatOrder) api.entities.removeTag(fixerId, "passed-priority");
+    });
   }
-  ruleHandlers.register("resetPriorityPass", (_event, api) => {
-    for (const fixerId of seatOrder) api.entities.removeTag(fixerId, "passed-priority");
-  });
 
   /** "Every fixer has passed" — a plain fold, not a stateful counter. Read by room.ts's own "pass" message handler to decide whether to resolve now. */
   const allFixersPassed: BoolExpr = {
@@ -690,17 +645,19 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   // uniformly for every setParent call underneath ALL of push/reparent/
   // splice, so binding here catches every case by construction rather
   // than by enumerating each Stack method that could cause it.
-  ruleTable.add({
-    id: "sync-has-active-response-on-parent-change",
-    trigger: "hierarchy:parentChanged",
-    match: (event) => event.hierarchy === RESOLUTION_STACK_NAME && event.parentId !== null && event.parentId !== undefined,
-    effect: "tagHasActiveResponse",
-  });
-  ruleHandlers.register("tagHasActiveResponse", (event, api) => {
-    const e = event as Extract<typeof event, { type: "hierarchy:parentChanged" }>;
-    // match() already guarantees parentId is a real EntityId here.
-    api.entities.addTag(e.parentId as EntityId, "has-active-response");
-  });
+  registerRule(
+    ruleTable,
+    ruleHandlers,
+    {
+      id: "sync-has-active-response-on-parent-change",
+      trigger: "hierarchy:parentChanged",
+      match: (event) => event.hierarchy === RESOLUTION_STACK_NAME && event.parentId !== null && event.parentId !== undefined,
+    },
+    (event, api) => {
+      // match() already guarantees parentId is a real EntityId here.
+      api.entities.addTag(event.parentId as EntityId, "has-active-response");
+    },
+  );
 
   // The untagging half: a parent becomes newly childless EXACTLY when one
   // of the three exposure events fires for it (see stack.ts's own
@@ -719,46 +676,127 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   // never be observed by anything. See content.test.ts's own "THE SPLICE
   // CASE" test for the precise trace.
   for (const trigger of ["stack:exposedAfterResolution", "stack:exposedAfterCounter", "stack:exposedAfterReparent"] as const) {
-    ruleTable.add({ id: `untag-has-active-response-on-${trigger}`, trigger, effect: "untagHasActiveResponse" });
+    registerRule(ruleTable, ruleHandlers, { id: `untag-has-active-response-on-${trigger}`, trigger }, (event, api) => {
+      api.entities.removeTag(event.itemId, "has-active-response");
+    });
   }
-  ruleHandlers.register("untagHasActiveResponse", (event, api) => {
-    const e = event as Extract<typeof event, { type: "stack:exposedAfterResolution" | "stack:exposedAfterCounter" | "stack:exposedAfterReparent" }>;
-    api.entities.removeTag(e.itemId, "has-active-response");
+
+  // --- Reflex genre: now engine-level (src/actions/reflex.ts) ----------
+  //
+  // Promoted after this game's own first instance (Countermeasure)
+  // proved the pattern out — checked directly before promoting: every
+  // dependency it touched was already generic engine machinery, and the
+  // only cyberfixer-specific things were two hardcoded strings (the
+  // anchor entity id and counter property name), now supplied here as
+  // ordinary configuration instead of being baked into the function
+  // itself. `reflexDeps` bundles this game's own instances of what the
+  // engine version needs; `registerReflex(reflexDeps, config)` replaces
+  // what used to be a locally-defined function of the same name.
+  const activateDefinition = actions.get("activate")!;
+  const reflexDeps: ReflexDeps = {
+    ruleTable,
+    ruleHandlers,
+    stack,
+    pendingActions,
+    effectHandlers,
+    bus,
+    activateDefinition,
+    anchorEntityId: "table-1",
+    counterProperty: "reflexCounter",
+  };
+
+  // Countermeasure — the first real Reflex-genre card: fires whenever a
+  // Coercion-category action is proposed targeting the bound Operative,
+  // triggering off the PUBLIC action:proposed event (which already
+  // carries targetIds in the clear) rather than reaching into the
+  // deliberately concealed PendingActionRegistry — a reactive trigger
+  // like this never needed concealment lifted in the first place.
+  const countermeasure: ActionDefinition = {
+    id: "countermeasure",
+    category: () => "coercion",
+    targetsOwn: false,
+    targetsOthers: true,
+    minTargets: () => 1,
+    maxTargets: () => 1,
+    targetQuery: (ctx) => ({ op: "and", exprs: [{ op: "hasTag", tag: CONTRACTOR_TAG }, { op: "not", expr: { op: "ownedBy", fixerId: ctx.actingFixerId } }] }),
+    performerCondition: () => ({ op: "hasTag", tag: abilityTag("countermeasure") }),
+    cost: () => ({ prop: "outflow", amount: 1 }),
+    effect: "countermeasureEffect",
+  };
+  abilities.register(countermeasure);
+  effectHandlers.register("countermeasureEffect", (ctx, api) => {
+    api.entities.addTag(ctx.targetIds[0]!, "flagged-by-countermeasure");
+  });
+
+  registerReflex(reflexDeps, {
+    id: "countermeasure-reflex",
+    boundAbilityTag: abilityTag("countermeasure"),
+    trigger: "action:proposed",
+    // Now checks precisely: the bound entity must actually be targeted,
+    // AND the triggering proposal's own ability must be Coercion-
+    // category — AND, critically, must not be "countermeasure" itself.
+    // That last exclusion isn't a style choice: without it, a
+    // countermeasure's own retaliation (itself Coercion-category,
+    // itself proposed via "activate") would immediately re-trigger this
+    // SAME reflex against its own proposer, who also carries
+    // ability:countermeasure (granted universally) — an unbounded
+    // retaliation ping-pong, caught live by the full test suite
+    // failing with 12 unrelated-looking errors that all traced back to
+    // EventBus's own maxEmitDepth cascade guard finally tripping.
+    // Extending action:proposed to carry params (previously missing —
+    // see the design note this replaced) is what makes this check
+    // possible at all; before that, category and abilityId were both
+    // structurally unrecoverable from the event.
+    matches: (event, boundEntityId) => {
+      if (!event.targetIds.includes(boundEntityId)) return false;
+      const abilityId = event.params?.abilityId as string | undefined;
+      if (abilityId === "countermeasure") return false;
+      const ability = abilities.get(abilityId ?? "");
+      return ability?.category({ performerId: event.performerId, actingFixerId: event.actingFixerId, targetIds: event.targetIds, params: event.params }) === "coercion";
+    },
+    responseAbilityId: "countermeasure",
+    buildIntent: (event) => {
+      return { targetIds: [event.performerId] }; // retaliate against whoever proposed the triggering action
+    },
   });
 
   // Automatic — a rule, not a player action. Gated on "drafted" so a
   // fixer's very first turn doesn't draw a card into hand before they've
   // even chosen their starting 3.
-  ruleTable.add({
-    id: "draw-card",
-    trigger: "phase:started",
-    match: (event) => event.phaseId === "upkeep",
-    subject: (event) => event.subjectId,
-    condition: { op: "hasTag", tag: "drafted" },
-    effect: "drawCard",
-  });
-  ruleHandlers.register("drawCard", (event, api) => {
-    const e = event as Extract<typeof event, { type: "phase:started" }>;
-    if (!api.randomFor) {
-      throw new Error("drawCard: no RandomRegistry was wired in — cannot draw without this fixer's isolated deck stream");
-    }
-    const drawnId = deck.draw(e.subjectId, api.randomFor(deckRandomDomain(e.subjectId)));
-    if (!drawnId) return; // empty deck, no-op
-    api.entities.moveToZone(drawnId, handZoneIdFor(e.subjectId));
-  });
+  registerRule(
+    ruleTable,
+    ruleHandlers,
+    {
+      id: "draw-card",
+      trigger: "phase:started",
+      match: (event) => event.phaseId === "upkeep",
+      subject: (event) => event.subjectId,
+      condition: { op: "hasTag", tag: "drafted" },
+    },
+    (event, api) => {
+      if (!api.randomFor) {
+        throw new Error("drawCard: no RandomRegistry was wired in — cannot draw without this fixer's isolated deck stream");
+      }
+      const drawnId = deck.draw(event.subjectId, api.randomFor(deckRandomDomain(event.subjectId)));
+      if (!drawnId) return; // empty deck, no-op
+      api.entities.moveToZone(drawnId, handZoneIdFor(event.subjectId));
+    },
+  );
 
-  ruleTable.add({
-    id: "stamp-discarded-at",
-    trigger: "entity:zoneChanged",
-    match: (event) => discardZoneIds.has(event.newZoneId ?? ""),
-    subject: (event) => event.entityId,
-    effect: "stampDiscardedAt",
-  });
-  ruleHandlers.register("stampDiscardedAt", (event, api) => {
-    const e = event as Extract<typeof event, { type: "entity:zoneChanged" }>;
-    const currentTurn = api.resolver.getProperty("table-1", "turnCounter") ?? 0;
-    api.entities.setProperty(e.entityId, "discardedAt", currentTurn);
-  });
+  registerRule(
+    ruleTable,
+    ruleHandlers,
+    {
+      id: "stamp-discarded-at",
+      trigger: "entity:zoneChanged",
+      match: (event) => discardZoneIds.has(event.newZoneId ?? ""),
+      subject: (event) => event.entityId,
+    },
+    (event, api) => {
+      const currentTurn = api.resolver.getProperty("table-1", "turnCounter") ?? 0;
+      api.entities.setProperty(event.entityId, "discardedAt", currentTurn);
+    },
+  );
 
   // Increments once per individual turn (phase:started fires exactly
   // once per turn change, for either fixer) — deliberately a RULE, not
@@ -770,8 +808,7 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   // guarantees correctness here. Seeded at 0 in setup.ts — this fires on
   // the very first phase:started too (from turnCycle.start()), taking it
   // to 1 for turn 1, exactly as if it had always been reactive.
-  ruleTable.add({ id: "increment-turn-counter", trigger: "phase:started", match: (event) => event.phaseId === "upkeep", priority: -10, effect: "incrementTurnCounter" });
-  ruleHandlers.register("incrementTurnCounter", (_event, api) => {
+  registerRule(ruleTable, ruleHandlers, { id: "increment-turn-counter", trigger: "phase:started", match: (event) => event.phaseId === "upkeep", priority: -10 }, (_event, api) => {
     const current = api.resolver.getProperty("table-1", "turnCounter") ?? 0;
     api.entities.setProperty("table-1", "turnCounter", current + 1);
   });
@@ -781,8 +818,7 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   // that still has a pending cancellation penalty, via the SAME modifier
   // `source` string used to apply it, and removes the modifier once
   // hasBeenDiscardedForXTurns says its window has passed.
-  ruleTable.add({ id: "tick-contract-penalties", trigger: "phase:started", match: (event) => event.phaseId === "upkeep", priority: 0, effect: "tickContractPenalties" });
-  ruleHandlers.register("tickContractPenalties", (_event, api) => {
+  registerRule(ruleTable, ruleHandlers, { id: "tick-contract-penalties", trigger: "phase:started", match: (event) => event.phaseId === "upkeep", priority: 0 }, (_event, api) => {
     for (const card of api.entities.getAllEntities()) {
       if (card.properties.discardedAt === undefined) continue;
       const ownerId = currentOwner(card);
@@ -830,19 +866,11 @@ export function buildContent(seatOrder: readonly EntityId[], bus: EventBus, enti
   });
 
   // --- defeat --------------------------------------------------------
+  //
+  // Extracted to content-defeat.ts — the first proof of the
+  // BuildContext pattern this file is gradually splitting into.
 
-  ruleTable.add({
-    id: "check-defeat",
-    trigger: "entity:propertyChanged",
-    match: (event) => event.prop === "inflow",
-    subject: (event) => event.entityId,
-    condition: propertyCompare("inflow", "lte", 0),
-    effect: "markDefeated",
-  });
-  ruleHandlers.register("markDefeated", (event, api) => {
-    const e = event as Extract<typeof event, { type: "entity:propertyChanged" }>;
-    api.entities.addTag(e.entityId, "defeated");
-  });
+  registerDefeat({ ruleTable, ruleHandlers });
 
-  return { actions, abilities, effectHandlers, ruleTable, ruleHandlers, contracts, queryFunctions, bounds, pregamePhase, postgamePhase, turnPhases, autoAdvancingPhaseIds, resolutionHierarchy, stack, priority, allFixersPassed, resolutionPolicy, deckHierarchy, hierarchies, deck };
+  return { actions, abilities, effectHandlers, ruleTable, ruleHandlers, contracts, queryFunctions, bounds, pregamePhase, postgamePhase, turnPhases, autoAdvancingPhaseIds, resolutionHierarchy, stack, pendingActions, priority, allFixersPassed, resolutionPolicy, deckHierarchy, hierarchies, deck };
 }

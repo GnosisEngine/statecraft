@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { EventBus } from "../events/bus.ts";
 import { EntityStore } from "../events/entity-store.ts";
 import { Hierarchy } from "../events/hierarchy.ts";
-import { Stack, LIFO_POLICY, FIFO_POLICY } from "../events/stack.ts";
+import { Stack, LIFO_POLICY, FIFO_POLICY, bidAwarePolicy } from "../events/stack.ts";
 import { createCard, createHand, transferOwnership } from "../core/entity.ts";
 import { ModifierStore } from "../properties/modifier-store.ts";
 import { PropertyResolver } from "../properties/property-resolver.ts";
@@ -654,5 +654,54 @@ describe("Stack — 'Insurance Policy': a MODIFIER on pushedAtSequence behaves g
     // what the modifier makes PropertyResolver report
     const constantPolicy: NumExpr = { op: "lit", value: 0 };
     expect(stack.resolveNext(constantPolicy, ctx)).toBe("b"); // genuinely more recent by raw sequence — the modifier fooled nothing here
+  });
+});
+
+describe("Stack — bidAwarePolicy: a single, fixed policy that scores bids correctly AND behaves identically to LIFO for everything that never bid at all", () => {
+  it("an item with ANY committed amount always outranks one with none, regardless of push order — a late, cheap non-bid never beats an early, real bid", () => {
+    const { stack, entities, ctx } = makeStack();
+    push(entities, stack, "ordinary", null); // pushed first, no bid — committedAmount reads 0
+    push(entities, stack, "bidder", null); // pushed second — but actually committed something
+    entities.get("bidder")!.properties.committedAmount = 3;
+
+    // LIFO alone would favor "bidder" anyway here (pushed later) — make
+    // the ordinary item pushed LATER instead, so ONLY the bid-aware
+    // scoring (not push order) can explain the winner
+    push(entities, stack, "later-ordinary", null);
+
+    const policy = bidAwarePolicy("committedAmount");
+    expect(stack.resolveNext(policy, ctx)).toBe("bidder"); // wins despite being pushed before "later-ordinary"
+  });
+
+  it("among two real bids, the HIGHER committed amount wins, regardless of which was proposed first", () => {
+    const { stack, entities, ctx } = makeStack();
+    push(entities, stack, "early-big-bid", null);
+    entities.get("early-big-bid")!.properties.committedAmount = 10;
+    push(entities, stack, "late-small-bid", null); // pushed later — LIFO alone would favor this one
+    entities.get("late-small-bid")!.properties.committedAmount = 2;
+
+    const policy = bidAwarePolicy("committedAmount");
+    expect(stack.resolveNext(policy, ctx)).toBe("early-big-bid"); // higher commitment wins despite being older
+  });
+
+  it("with NO bids anywhere on the stack, behaves IDENTICALLY to plain LIFO_POLICY — most recently pushed wins, same as today's default", () => {
+    const { stack, entities, ctx } = makeStack();
+    push(entities, stack, "a", null);
+    push(entities, stack, "b", null);
+    push(entities, stack, "c", null); // most recent, no one bid on anything
+
+    const policy = bidAwarePolicy("committedAmount");
+    expect(stack.resolveNext(policy, ctx)).toBe("c"); // exactly what LIFO_POLICY alone would have picked
+  });
+
+  it("two equal commitments still resolve by push order — pushedAtSequence keeps its own tie-break role, unchanged", () => {
+    const { stack, entities, ctx } = makeStack();
+    push(entities, stack, "first-bid", null);
+    entities.get("first-bid")!.properties.committedAmount = 5;
+    push(entities, stack, "second-bid", null); // same commitment, pushed later
+    entities.get("second-bid")!.properties.committedAmount = 5;
+
+    const policy = bidAwarePolicy("committedAmount");
+    expect(stack.resolveNext(policy, ctx)).toBe("second-bid"); // genuine tie broken by push order, same role pushedAtSequence already plays for LIFO/FIFO
   });
 });

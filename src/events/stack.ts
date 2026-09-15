@@ -83,6 +83,44 @@ export const LIFO_POLICY: NumExpr = { op: "prop", name: "pushedAtSequence" };
 export const FIFO_POLICY: NumExpr = { op: "mul", left: { op: "lit", value: -1 }, right: { op: "prop", name: "pushedAtSequence" } };
 
 /**
+ * Scaled high enough that ANY nonzero committed amount always outranks
+ * push order entirely, regardless of how long a match has run —
+ * pushedAtSequence only ever needs to break ties AMONG equal bids (most
+ * commonly, ties among items that never bid at all, i.e. amountProp
+ * reads 0 for both).
+ */
+export const BID_SCALE = 1_000_000;
+
+/**
+ * A single, fixed policy that behaves correctly whether or not ANY
+ * given candidate is actually a bid — no runtime "which policy should
+ * we use right now" switch needed anywhere, and safe to use as an
+ * entire game's own DEFAULT resolutionPolicy, not just during an active
+ * bid war. Scores by `amountProp * BID_SCALE + pushedAtSequence`: for
+ * an item that never committed anything under `amountProp` (the
+ * overwhelming majority of ordinary, non-bid pending items), that term
+ * reads 0 — see PropertyResolver's own "missing property resolves to
+ * 0" convention — so the score collapses to plain pushedAtSequence,
+ * IDENTICAL to LIFO_POLICY's own behavior. An item that DID commit
+ * something always outranks one that didn't, and among two committed
+ * amounts, the higher one wins — pushedAtSequence still breaks a
+ * genuine tie between two equal commitments, the same tie-break role
+ * it already plays for LIFO/FIFO.
+ *
+ * `amountProp` is a parameter, not a fixed convention, so a game can
+ * name its own committed-amount property however it likes (and so two
+ * independent bid mechanics in the same game, scored by different
+ * properties, don't collide with each other).
+ */
+export function bidAwarePolicy(amountProp: string): NumExpr {
+  return {
+    op: "add",
+    left: { op: "mul", left: { op: "prop", name: amountProp }, right: { op: "lit", value: BID_SCALE } },
+    right: { op: "prop", name: "pushedAtSequence" },
+  };
+}
+
+/**
  * Wire/snapshot format for one Stack's OWN bookkeeping — deliberately
  * NOT the tree structure itself (that's the underlying Hierarchy's job,
  * already captured by SerializedHierarchy/Snapshot). `pending` is

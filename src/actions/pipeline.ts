@@ -26,6 +26,7 @@ import {
   type PerformerCapability,
 } from "./action-definition.ts";
 import type { EffectHandlerRegistry, ResolvedActionContext } from "./effect-handler.ts";
+import type { PendingActionRegistry } from "./pending-action-registry.ts";
 import { noPriorityWindow, type PriorityWindowResolver } from "./priority-window.ts";
 
 export type ActionResult =
@@ -109,6 +110,8 @@ export interface PerformActionDeps extends ValidateDeps {
   handlers: EffectHandlerRegistry;
   bus: EventBus;
   priorityWindowResolver?: PriorityWindowResolver;
+  /** Only needed if an effect handler reads api.pendingActions — see ActionApi's own docs for what that's for and why it's deliberately narrow. Optional here (unlike Snapshot's own required-nullable pendingActionRegistry param) because PerformActionDeps is constructed in dozens of test rigs that have nothing to do with interactive, propose-now-resolve-later play at all — forcing every one of them to pass null would be pure boilerplate, not a meaningful safety improvement the way it is for Snapshot's own, much narrower set of call sites. */
+  pendingActions?: PendingActionRegistry;
 }
 
 /**
@@ -129,6 +132,7 @@ export function proposeAction(intent: ActionContext, definition: ActionDefinitio
     performerId: intent.performerId,
     actingFixerId: intent.actingFixerId,
     targetIds: intent.targetIds,
+    params: intent.params,
   });
 
   const result = validateAction(intent, definition, deps);
@@ -266,7 +270,14 @@ export function resolveEffect(intent: ActionContext, definition: ActionDefinitio
   }
 
   const resolvedCtx: ResolvedActionContext = { ...intent, capability, adjustedCost };
-  handler(resolvedCtx, { entities: deps.entities, modifiers: deps.modifiers, resolver: deps.resolver, random: deps.random, randomFor: makeRandomFor(deps.randomRegistry) });
+  handler(resolvedCtx, {
+    entities: deps.entities,
+    modifiers: deps.modifiers,
+    resolver: deps.resolver,
+    random: deps.random,
+    randomFor: makeRandomFor(deps.randomRegistry),
+    pendingActions: deps.pendingActions,
+  });
 
   deps.bus.emit({
     type: "action:resolved",

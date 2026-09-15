@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createCard } from "../../../src/core/entity.ts";
 import { EventBus } from "../../../src/events/bus.ts";
 import { evaluateBoolExpr } from "../../../src/query/interpreter.ts";
+import type { BoolExpr } from "../../../src/query/types.ts";
 import { EntityStore } from "../../../src/events/entity-store.ts";
 import { ModifierStore } from "../../../src/properties/modifier-store.ts";
 import { PropertyResolver } from "../../../src/properties/property-resolver.ts";
@@ -657,5 +658,69 @@ describe("'has-active-response' tag: the Option-1 answer to 'nothing else is cur
 
     const illegal = proposeAction({ performerId: "performer", actingFixerId: "fixer-A", targetIds: ["contested"] }, onlyUncontested, deps);
     expect(illegal.ok).toBe(false);
+  });
+});
+
+describe("'wouldQualifyAsTarget': the dry-run sibling to Wiretap's full reveal — 'am I the kind of thing this could hit', not 'who is it actually hitting'", () => {
+  it("returns true for a candidate that matches the pending action's own targetQuery, false for one that doesn't", () => {
+    const { entities, resolver, content } = makeRig();
+    entities.add(createCard("Qualifying Candidate", { id: "qualifies" }));
+    entities.get("qualifies")!.tags.add("contractor");
+    entities.add(createCard("Non-Qualifying Candidate", { id: "disqualifies" })); // no "contractor" tag
+
+    content.pendingActions.set("pending-shakedown", {
+      intent: { performerId: "ace", actingFixerId: "fixer-A", targetIds: ["some-actual-target"] },
+      actionId: "activate",
+      definition: {
+        id: "activate",
+        category: () => "coercion",
+        targetsOwn: false,
+        targetsOthers: true,
+        targetQuery: () => ({ op: "hasTag", tag: "contractor" }),
+        effect: "noopDryRunEffect",
+      },
+      capability: "preferred",
+      adjustedCost: 2,
+    });
+
+    const dryRunExpr: BoolExpr = { op: "call", fn: "wouldQualifyAsTarget", args: { pendingItemId: "pending-shakedown" } };
+    expect(evaluateBoolExpr(dryRunExpr, "qualifies", resolver)).toBe(true);
+    expect(evaluateBoolExpr(dryRunExpr, "disqualifies", resolver)).toBe(false);
+  });
+
+  it("returns false, not a throw, when pendingItemId doesn't refer to anything actually pending", () => {
+    const { resolver } = makeRig();
+    const dryRunExpr: BoolExpr = { op: "call", fn: "wouldQualifyAsTarget", args: { pendingItemId: "nonexistent-item" } };
+    expect(evaluateBoolExpr(dryRunExpr, "anyone", resolver)).toBe(false);
+  });
+
+  it("THE ACTUAL POINT: does NOT reveal who's really targeted — a candidate matching the targetQuery reads true even when a DIFFERENT entity is the real, actual target, and a candidate that's actually named in intent.targetIds but does NOT match the current targetQuery still reads false", () => {
+    const { entities, resolver, content } = makeRig();
+    entities.add(createCard("Actual Target", { id: "actual-target" }));
+    entities.get("actual-target")!.tags.add("contractor");
+    entities.add(createCard("Merely Similar", { id: "merely-similar" })); // never named as a target at all
+    entities.get("merely-similar")!.tags.add("contractor"); // but matches the SAME targetQuery
+
+    content.pendingActions.set("pending-shakedown", {
+      intent: { performerId: "ace", actingFixerId: "fixer-A", targetIds: ["actual-target"] }, // ONLY actual-target is really named
+      actionId: "activate",
+      definition: {
+        id: "activate",
+        category: () => "coercion",
+        targetsOwn: false,
+        targetsOthers: true,
+        targetQuery: () => ({ op: "hasTag", tag: "contractor" }),
+        effect: "noopDryRunEffect",
+      },
+      capability: "preferred",
+      adjustedCost: 2,
+    });
+
+    const dryRunExpr: BoolExpr = { op: "call", fn: "wouldQualifyAsTarget", args: { pendingItemId: "pending-shakedown" } };
+    // both read true — a fixer running this dry-run on "merely-similar"
+    // has NO way to distinguish "I'm the real target" from "I merely
+    // match the profile of something else's real target"
+    expect(evaluateBoolExpr(dryRunExpr, "actual-target", resolver)).toBe(true);
+    expect(evaluateBoolExpr(dryRunExpr, "merely-similar", resolver)).toBe(true);
   });
 });

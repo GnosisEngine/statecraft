@@ -36,7 +36,6 @@ import { createSnapshot, type Snapshot } from "../../../src/persistence/snapshot
 import { RuleEngine } from "../../../src/rules/rule-engine.ts";
 import { performAction, proposeAction, resolveEffect, type ActionResult, type PerformActionDeps } from "../../../src/actions/pipeline.ts";
 import type { ActionContext, ActionDefinition } from "../../../src/actions/action-definition.ts";
-import { PendingActionRegistry } from "../../../src/actions/pending-action-registry.ts";
 import { PhaseHandlerRegistry, type PhaseDefinition } from "../../../src/phases/phase-definition.ts";
 import { TurnCycle } from "../../../src/phases/turn-cycle.ts";
 import { Match } from "../../../src/phases/match.ts";
@@ -62,7 +61,6 @@ export default class CyberFixerRoom extends TableRoom {
   private sync!: SyncManager;
   private seatOrder!: readonly EntityId[];
   private log!: EventLog;
-  private pendingActions!: PendingActionRegistry;
   private lastSnapshot: Snapshot | null = null;
 
   onCreate(options: TableRoomCreateOptions): void {
@@ -86,7 +84,6 @@ export default class CyberFixerRoom extends TableRoom {
     // per-fixer stream too, with no extra bookkeeping.
     const matchSeed = randomSeed();
     this.log = new EventLog(matchSeed);
-    this.pendingActions = new PendingActionRegistry();
     const random = new SeededRandom(matchSeed);
     const randomRegistry = new RandomRegistry();
     for (const fixerId of options.seatOrder) {
@@ -125,6 +122,7 @@ export default class CyberFixerRoom extends TableRoom {
       bus,
       random,
       randomRegistry,
+      pendingActions: this.content.pendingActions,
     };
 
     const phases: PhaseDefinition[] = this.content.turnPhases;
@@ -218,7 +216,7 @@ export default class CyberFixerRoom extends TableRoom {
 
       if (evaluateBoolExpr(this.content.allFixersPassed, "table-1", this.resolver)) {
         const resolvedId = this.content.stack.resolveNext(this.content.resolutionPolicy, this.resolver);
-        const pending = this.pendingActions.get(resolvedId);
+        const pending = this.content.pendingActions.get(resolvedId);
         if (!pending) {
           throw new Error(`pass: resolved stack item "${resolvedId}" has no stored PendingAction — this should be unreachable`);
         }
@@ -227,7 +225,7 @@ export default class CyberFixerRoom extends TableRoom {
         // the broadcast itself differs, so both fixers (not just
         // whoever sent this pass) know which one actually happened.
         const outcome = resolveEffect(pending.intent, pending.definition, pending.capability, pending.adjustedCost, this.deps);
-        this.pendingActions.delete(resolvedId);
+        this.content.pendingActions.delete(resolvedId);
         this.entities.remove(resolvedId); // the placeholder pending-item entity has served its purpose
         this.broadcast("resolution-result", { resolvedId, actionId: pending.definition.id, fizzled: outcome.fizzled, reason: outcome.reason });
       }
@@ -279,7 +277,7 @@ export default class CyberFixerRoom extends TableRoom {
    */
   private proposeAndPush(message: RawActionIntent, intent: ActionContext, definition: ActionDefinition, seatId: EntityId): ActionResult {
     const respondingTo = message.respondingTo ?? null;
-    if (respondingTo !== null && !this.pendingActions.has(respondingTo)) {
+    if (respondingTo !== null && !this.content.pendingActions.has(respondingTo)) {
       return { ok: false, reason: `"${respondingTo}" is not currently pending — it may have already resolved or been countered` };
     }
 
@@ -293,9 +291,19 @@ export default class CyberFixerRoom extends TableRoom {
         if (proposed.ok) {
           const pendingCard = createCard(`Pending: ${definition.id}`, { id: pendingId, ownership: [seatId] });
           pendingCard.tags.add("pending-action"); // discoverable marker — a client (or a future card's targetQuery) can find every currently-proposed item without guessing from the id's own prefix
+          // Bidding: ANY action whose own category is "bid" gets its
+          // actual paid cost recorded on the placeholder entity itself,
+          // generically — not special-cased per bid card. This is what
+          // content.ts's own bid-aware resolutionPolicy reads; an
+          // ordinary, non-bid action never sets this at all, so it
+          // reads 0 and the policy collapses to plain push order for
+          // it, exactly as if this branch didn't exist.
+          if (definition.category(intent) === "bid") {
+            pendingCard.properties.committedAmount = proposed.adjustedCost;
+          }
           this.entities.add(pendingCard);
           this.content.stack.push(pendingId, respondingTo);
-          this.pendingActions.set(pendingId, { intent, actionId: message.actionId, definition, capability: proposed.capability, adjustedCost: proposed.adjustedCost });
+          this.content.pendingActions.set(pendingId, { intent, actionId: message.actionId, definition, capability: proposed.capability, adjustedCost: proposed.adjustedCost });
         }
         return proposed;
       },
@@ -335,7 +343,7 @@ export default class CyberFixerRoom extends TableRoom {
     }
   }
 
-  /** Every SNAPSHOT_INTERVAL confirmed commands, captures entities/modifiers/every registered Hierarchy AND Stack AND pending proposal — see EventLog/Snapshot's own docs for why a rejected command (log.length unchanged) never triggers this. content.stack (the shared resolution stack), its own underlying Hierarchy, and this.pendingActions are all real, live instances now — omitting any would silently lose their bookkeeping on any resume, exactly the bug Snapshot's own hierarchies/stacks/pendingActionRegistry params exist to prevent (see snapshot.ts's header — "Ghost in the Machine"). */
+  /** Every SNAPSHOT_INTERVAL confirmed commands, captures entities/modifiers/every registered Hierarchy AND Stack AND pending proposal — see EventLog/Snapshot's own docs for why a rejected command (log.length unchanged) never triggers this. content.stack (the shared resolution stack), its own underlying Hierarchy, and content.pendingActions are all real, live instances now — omitting any would silently lose their bookkeeping on any resume, exactly the bug Snapshot's own hierarchies/stacks/pendingActionRegistry params exist to prevent (see snapshot.ts's header — "Ghost in the Machine"). */
   private maybeSnapshot(): void {
     if (this.log.length > 0 && this.log.length % SNAPSHOT_INTERVAL === 0) {
       this.lastSnapshot = createSnapshot(
@@ -344,7 +352,7 @@ export default class CyberFixerRoom extends TableRoom {
         this.log.length - 1,
         [this.content.deckHierarchy, this.content.resolutionHierarchy],
         [this.content.stack],
-        this.pendingActions,
+        this.content.pendingActions,
       );
     }
   }

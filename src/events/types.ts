@@ -35,7 +35,7 @@ export type GameEvent =
   | { type: "stack:exposedAfterReparent"; stack: string; itemId: EntityId }
   | { type: "modifier:added"; modifier: Modifier }
   | { type: "modifier:removed"; modifier: Modifier }
-  | { type: "action:proposed"; actionId: string; performerId: EntityId; actingFixerId: EntityId; targetIds: EntityId[] }
+  | { type: "action:proposed"; actionId: string; performerId: EntityId; actingFixerId: EntityId; targetIds: EntityId[]; params?: Record<string, unknown> }
   | { type: "action:rejected"; actionId: string; performerId: EntityId; actingFixerId: EntityId; reason: string }
   | {
       type: "action:resolved";

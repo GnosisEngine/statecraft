@@ -17,6 +17,7 @@
  */
 
 import type { EntityId } from "../core/id.ts";
+import { namespacedTag } from "../core/tags.ts";
 import type { BoolExpr } from "../query/types.ts";
 
 export type PerformerCapability = "preferred" | "weak" | "neutral";
@@ -117,8 +118,8 @@ export function resolvePerformerCapability(
   performerTags: ReadonlySet<string>,
   category: string,
 ): PerformerCapability {
-  if (performerTags.has(`pref:${category}`)) return "preferred";
-  if (performerTags.has(`weak:${category}`)) return "weak";
+  if (performerTags.has(namespacedTag("pref", category))) return "preferred";
+  if (performerTags.has(namespacedTag("weak", category))) return "weak";
   return "neutral";
 }
 

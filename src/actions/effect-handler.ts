@@ -13,6 +13,7 @@ import type { EntityStore } from "../events/entity-store.ts";
 import type { ModifierStore } from "../properties/modifier-store.ts";
 import type { PropertyResolver } from "../properties/property-resolver.ts";
 import type { SeededRandom } from "../persistence/seeded-random.ts";
+import type { PendingActionRegistry } from "./pending-action-registry.ts";
 import type { ActionContext, PerformerCapability } from "./action-definition.ts";
 
 export interface ResolvedActionContext extends ActionContext {
@@ -41,6 +42,21 @@ export interface ActionApi {
    * since that would defeat the entire point of isolating the domain.
    */
   randomFor?(domain: string): SeededRandom;
+  /**
+   * Reference to the game's own PendingActionRegistry, if it has one —
+   * present only when PerformActionDeps was constructed with one (see
+   * pipeline.ts's own docs). Lets an effect reach OTHER currently-
+   * pending proposals — e.g. a Data-domain ability revealing what a
+   * specific pending action's own intent.targetIds actually are, a
+   * capability that's deliberately NOT exposed through the query
+   * grammar itself (PendingAction.definition has live function fields
+   * that can't be represented as BoolExpr/NumExpr data at all — see
+   * pending-action-registry.ts's own header). This is the one blessed,
+   * narrow channel for reaching in anyway, from inside an effect
+   * that's specifically designed to do exactly that — not a general
+   * escape hatch every effect gets by default.
+   */
+  pendingActions?: PendingActionRegistry;
 }
 
 export type EffectHandler = (ctx: ResolvedActionContext, api: ActionApi) => void;

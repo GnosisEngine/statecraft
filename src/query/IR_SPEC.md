@@ -117,6 +117,26 @@ for a `PropertyResolver`-backed context it's the fully modifier-resolved
 about which — it just calls `getProperty` and uses what comes back. A
 missing/never-set property resolves to `0`, not an error.
 
+**`NumExpr` has no conditional/ternary op, and this is intentional, not
+an oversight to eventually fill in.** The table above is the complete
+set — there is no `if`/`select`/branch of any kind. A policy that needs
+different scoring behavior depending on some condition has to express
+that arithmetically instead. `games/cyberfixer`'s own
+`bidAwarePolicy(amountProp)` (`src/events/stack.ts`) is the concrete,
+load-bearing example: rather than "if this item has a committed
+amount, score by that, else score by push order," it scores every
+candidate as `amountProp * BID_SCALE + pushedAtSequence` — for an item
+that never committed anything, `amountProp` reads `0` (the missing-
+property convention above), so the term vanishes and the score
+collapses to plain push order, identical to not having the term at all.
+The scale constant only needs to be large enough that any genuine
+commitment always dominates ordinary push-order ties. This
+weighted-sum-instead-of-branch pattern is the canonical way to express
+conditional scoring in this grammar; a DSL compiler targeting `NumExpr`
+should either compile an `if` down to this shape automatically or
+reject conditional scoring expressions outright, rather than assuming
+the target IR can represent a branch directly.
+
 ### 3.2 `BoolExpr` ops
 
 | op | reads | notes |
@@ -236,6 +256,39 @@ fold's own `of` subtree. The inner fold's own `where` still sees the
 OUTER value for that label (its own binding doesn't exist until a match
 is chosen), which is what makes the correlation in the worked example
 below actually work.
+
+**A real, confirmed limit worth stating plainly: the top-level ambient
+subject is never automatically bound to a label.** Only a fold's own
+`as` binds anything into `LabelScope` — the `subjectId` a top-level
+caller passes in (a `targetQuery` candidate, a rule's `condition`
+subject) has no name of its own a nested fold could reference back to.
+This means a query like "does anything else currently point at me" —
+count entities matching some relationship *to the outer subject
+itself* — cannot be expressed directly: the only tool for reaching the
+outer subject from inside a nested fold is a label some ENCLOSING fold
+already bound, and the top level is never such a fold.
+
+Confirmed by actually attempting it, not assumed: `games/cyberfixer`'s
+own `content.test.ts` ("Surveillance State" / "the reverse direction")
+builds exactly this query —
+`{ op: "fold", fold: "count", where: { op: "childOf", parent: { op:
+"ref", label: "me" } } }` evaluated with no enclosing fold ever binding
+`"me"` — and it throws the interpreter's own genuine `ref to unbound
+label "me"` error, not a special-cased rejection. The forward direction
+(a candidate checking `childOf`/`descendantOf` against a *known*,
+already-identified entity) works fine and is exactly what
+`selectEntities` already supports; it's specifically the "reach back to
+whatever the top-level caller was" direction that has no path in the
+current grammar. A DSL or compiler targeting this IR should treat this
+as a hard limitation to design around (e.g. requiring the author to
+name the outer subject explicitly some other way), not a bug to route
+around cleverly — the two options that WOULD close it (auto-binding the
+ambient subject to a reserved label everywhere, or a registered
+`QueryFunction` doing the traversal directly) are both real, both
+considered, and both deliberately not built, precisely because the
+narrower, tag-maintained alternative (see `has-active-response` in
+`games/cyberfixer`) turned out to answer the actual card design
+question more cheaply.
 
 ### Worked example: correlated aggregation (`SUM(COUNT(...))`)
 

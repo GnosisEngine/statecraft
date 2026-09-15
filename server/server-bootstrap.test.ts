@@ -311,4 +311,106 @@ describe("full server bootstrap: discovery + static serving + a live game, in on
     expect(activeTagged(alice.state)).toEqual(["fixer-B"]);
     expect(activeTagged(bob.state)).toEqual(["fixer-B"]);
   });
+
+  it("a real bid war, over the actual network: two competing claims on the SAME target, at different bid amounts — the higher one wins ownership, and the loser fizzles on its own re-validation once the target's already been won", async () => {
+    const room = await server.createRoom("cyberfixer", {});
+    const alice = await server.connectTo(room, { identity: "alice" });
+    const bob = await server.connectTo(room, { identity: "bob" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const { ace, runner } = await draftAndReadyBoth(alice, bob);
+
+    // Alice proposes a LOW claim on Bob's Runner first...
+    const lowBidPromise = new Promise((resolve) => alice.onMessage("action-result", resolve));
+    alice.send("action", { actionId: "activate", performerId: ace.id, targetIds: [runner.id], params: { abilityId: "claim", bidAmount: 1 } });
+    const lowBid = await lowBidPromise;
+    expect(lowBid).toMatchObject({ ok: true });
+
+    // ...then, before anyone passes, raises with a SECOND, higher claim
+    // on the identical target — both are now genuinely pending at once.
+    // (1 + 3 = 4, safely within fixer-A's total outflow budget of 5 —
+    // Ace/Nomad/Vex's own outflowGrant of 2+2+1 — so this fails on its
+    // own legality, not on being unaffordable.)
+    const highBidPromise = new Promise((resolve) => alice.onMessage("action-result", resolve));
+    alice.send("action", { actionId: "activate", performerId: ace.id, targetIds: [runner.id], params: { abilityId: "claim", bidAmount: 3 } });
+    const highBid = await highBidPromise;
+    expect(highBid).toMatchObject({ ok: true });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // Runner is still Bob's — NEITHER claim has resolved yet, both are
+    // just pending proposals so far
+    const runnerBeforeResolution = [...bob.state.entities.values()].find((e: { id: string }) => e.id === runner.id) as { ownership: string[] };
+    expect(runnerBeforeResolution.ownership.at(-1)).toBe("fixer-B");
+
+    // Both fixers pass — with nothing new to react to, resolution
+    // begins. The bid-aware policy resolves the HIGHER commitment
+    // first, regardless of which claim was proposed first.
+    const firstResolutionPromise = new Promise((resolve) => bob.onMessage("resolution-result", resolve));
+    alice.send("pass", {});
+    bob.send("pass", {});
+    const firstResolution = await firstResolutionPromise;
+    expect(firstResolution).toMatchObject({ fizzled: false, actionId: "activate" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const runnerAfterFirstResolution = [...bob.state.entities.values()].find((e: { id: string }) => e.id === runner.id) as { ownership: string[] };
+    expect(runnerAfterFirstResolution.ownership.at(-1)).toBe("fixer-A"); // the HIGHER bid (5) won, not whichever was proposed first
+
+    // The remaining, lower claim is still pending — but it can no
+    // longer legally resolve: Runner is now owned by fixer-A, so
+    // "not ownedBy the acting fixer" (Alice) no longer holds.
+    // resolveEffect's own re-validation ("Protection") catches this
+    // automatically — no special-casing needed for "what if I already
+    // won the bid war with a different proposal."
+    const secondResolutionPromise = new Promise((resolve) => bob.onMessage("resolution-result", resolve));
+    alice.send("pass", {});
+    bob.send("pass", {});
+    const secondResolution = await secondResolutionPromise;
+    expect(secondResolution).toMatchObject({ fizzled: true });
+  });
+
+  it("Countermeasure, the first real Reflex-genre card, over the actual network: proposing a shakedown against a countermeasure-bearing Operative automatically proposes a real, paid retaliation — no manual action from the defender at all", async () => {
+    const room = await server.createRoom("cyberfixer", {});
+    const alice = await server.connectTo(room, { identity: "alice" });
+    const bob = await server.connectTo(room, { identity: "bob" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const { ace, runner } = await draftAndReadyBoth(alice, bob);
+
+    const shakedownPromise = new Promise((resolve) => alice.onMessage("action-result", resolve));
+    alice.send("action", { actionId: "activate", performerId: ace.id, targetIds: [runner.id], params: { abilityId: "shakedown" } });
+    const shakedownResult = await shakedownPromise;
+    expect(shakedownResult).toMatchObject({ ok: true });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // The reflex should have fired automatically — a second pending
+    // item now exists, targeting Ace (the shakedown's own performer),
+    // that NEITHER client explicitly proposed.
+    const pendingOnBob = [...bob.state.entities.values()].filter((e: { tags: Set<string> }) => e.tags.has("pending-action")) as { id: string; ownership: string[] }[];
+    expect(pendingOnBob.length).toBe(2); // the shakedown itself, plus the automatic countermeasure response
+    const retaliation = pendingOnBob.find((e) => e.ownership.at(-1) === "fixer-B");
+    expect(retaliation).toBeDefined(); // proposed on fixer-B's behalf, automatically, by the reflex rule — not by Bob's own client
+
+    // Bob's own outflow actually dropped — the retaliation genuinely
+    // paid its normal cost, exactly as CARDS.md's own Reflex text says
+    // ("no action required... you still pay its normal cost"), not a
+    // free ability.
+    const bobFixer = [...bob.state.entities.values()].find((e: { id: string }) => e.id === "fixer-B") as { properties: Map<string, number> };
+    expect(bobFixer.properties.get("outflow")).toBeLessThan(5); // Runner/Sentinel/Cipher's own combined outflowGrant, minus the retaliation's own cost
+
+    // Resolve everything — both pending items, whichever order the
+    // resolution policy picks — and confirm BOTH effects actually land:
+    // Runner is shaken (the original shakedown), AND Ace is flagged
+    // (the automatic countermeasure).
+    alice.send("pass", {});
+    bob.send("pass", {});
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    alice.send("pass", {});
+    bob.send("pass", {});
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const runnerAfter = [...bob.state.entities.values()].find((e: { id: string }) => e.id === runner.id) as { tags: Set<string> };
+    const aceAfter = [...bob.state.entities.values()].find((e: { id: string }) => e.id === ace.id) as { tags: Set<string> };
+    expect(runnerAfter.tags.has("shaken")).toBe(true);
+    expect(aceAfter.tags.has("flagged-by-countermeasure")).toBe(true);
+  });
 });

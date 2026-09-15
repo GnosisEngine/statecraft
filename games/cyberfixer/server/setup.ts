@@ -16,14 +16,15 @@
  */
 
 import { createCard, createHand, createTable, createZone } from "../../../src/core/entity.ts";
+import { namespacedTag } from "../../../src/core/tags.ts";
 import type { EntityStore } from "../../../src/events/entity-store.ts";
 import type { Deck } from "./deck.ts";
 import type { EntityId } from "../../../src/core/id.ts";
-import { CONTRACTOR_TAG, boardZoneIdFor, deckZoneIdFor, discardZoneIdFor, handZoneIdFor } from "./content.ts";
+import { CONTRACTOR_TAG, abilityTag, factionTag, boardZoneIdFor, deckZoneIdFor, discardZoneIdFor, handZoneIdFor, type Faction } from "./content.ts";
 
 interface ContractorSpec {
   name: string;
-  faction: string;
+  faction: Faction;
   inflow: number;
   /** How much this contractor contributes to its owner's outflow (spend budget) each turn — see content.ts's header on why this isn't just called "outflow". */
   outflowGrant: number;
@@ -96,10 +97,12 @@ export function setupMatch(entities: EntityStore, seatOrder: readonly EntityId[]
       // that "activate" requires an explicit ability:<id> tag as proof
       // the card actually grants what's being invoked, this tag is what
       // makes that still true.
-      contractor.tags.add("ability:shakedown");
-      contractor.tags.add(`faction:${spec.faction}`);
-      if (spec.pref) contractor.tags.add(`pref:${spec.pref}`);
-      if (spec.weak) contractor.tags.add(`weak:${spec.weak}`);
+      contractor.tags.add(abilityTag("shakedown"));
+      contractor.tags.add(abilityTag("claim"));
+      contractor.tags.add(abilityTag("countermeasure"));
+      contractor.tags.add(factionTag(spec.faction));
+      if (spec.pref) contractor.tags.add(namespacedTag("pref", spec.pref));
+      if (spec.weak) contractor.tags.add(namespacedTag("weak", spec.weak));
       entities.add(contractor);
       deck.addToPool(contractor.id, fixerId); // no siblingIndex — an unordered pool, not a stored sequence
     }
